@@ -36,28 +36,76 @@ fn run_privileged_command(cmd: &str, args: &[&str]) -> Result<std::process::Outp
 #[cfg(target_os = "macos")]
 fn run_privileged_command(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
     // macOS uses osascript for privilege escalation
-    let mut full_args = vec!["-e", &format!("do shell script \"{} {}\" with administrator privileges", cmd, args.join(" "))];
+    // Build shell-escaped command to prevent injection attacks
+    fn shell_escape(s: &str) -> String {
+        // Use single quotes, escaping any embedded single quotes
+        // This is the safest shell escaping method
+        format!("'{}'", s.replace("'", "'\\''"))
+    }
+    
+    let mut command_parts = vec![shell_escape(cmd)];
+    for arg in args {
+        command_parts.push(shell_escape(arg));
+    }
+    
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        command_parts.join(" ")
+    );
     
     Command::new("osascript")
-        .args(&full_args)
+        .arg("-e")
+        .arg(&script)
         .output()
         .map_err(|e| format!("Failed to run privileged command: {}", e))
 }
 
 #[cfg(target_os = "windows")]
-fn run_privileged_command(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    // Windows uses runas
-    let mut full_args = vec!["/user:Administrator", &format!("{} {}", cmd, args.join(" "))];
-    
-    Command::new("runas")
-        .args(&full_args)
+fn run_command(cmd: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    // On Windows, netsh commands work without elevation if app has appropriate permissions
+    // For firewall rules, the app should be run as administrator or have UAC consent
+    Command::new(cmd)
+        .args(args)
         .output()
-        .map_err(|e| format!("Failed to run privileged command: {}", e))
+        .map_err(|e| format!("Failed to run command '{}': {}", cmd, e))
 }
+
+#[cfg(target_os = "windows")]
+fn run_powershell(script: &str) -> Result<std::process::Output, String> {
+    // Run PowerShell command
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| format!("Failed to run PowerShell: {}", e))
+}
+
+#[cfg(target_os = "windows")]
+fn is_elevated() -> bool {
+    // Check if running with administrator privileges
+    let output = run_powershell(
+        "(New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
+    );
+    
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            stdout == "True"
+        },
+        Err(_) => false
+    }
+}
+
+// Windows firewall rule names
+#[cfg(target_os = "windows")]
+const FIREWALL_RULE_BLOCK: &str = "VPNht Kill Switch Block";
+#[cfg(target_os = "windows")]
+const FIREWALL_RULE_ALLOW_WG: &str = "VPNht Kill Switch Allow WireGuard";
 
 pub struct KillSwitch {
     enabled: bool,
     firewall_rules: Vec<String>,
+    #[cfg(target_os = "windows")]
+    wireguard_interface: Option<String>,
 }
 
 impl KillSwitch {
@@ -65,6 +113,8 @@ impl KillSwitch {
         Self {
             enabled: false,
             firewall_rules: Vec::new(),
+            #[cfg(target_os = "windows")]
+            wireguard_interface: None,
         }
     }
 
@@ -162,5 +212,208 @@ impl KillSwitch {
         
         info!("All non-VPN traffic blocked");
         Ok(())
+    }
+
+    // Windows implementation using netsh advfirewall
+    #[cfg(target_os = "windows")]
+    fn setup_wfp(&mut self) -> Result<(), String> {
+        info!("Setting up Windows Firewall Kill Switch");
+        
+        // Check if we have elevation
+        if !is_elevated() {
+            warn!("Kill Switch may require administrator privileges");
+        }
+
+        // Remove any existing rules first (cleanup from previous session)
+        self.remove_firewall_rules()?;
+
+        // Find WireGuard interface
+        let wg_interface = self.find_wireguard_interface()?;
+        if wg_interface.is_some() {
+            info!("Found WireGuard interface: {:?}", wg_interface);
+        }
+
+        // Create block rule for all outbound traffic
+        // netsh advfirewall firewall add rule name="..." dir=out action=block remoteip=any
+        let block_output = run_command("netsh", &[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={}", FIREWALL_RULE_BLOCK),
+            "dir=out",
+            "action=block",
+            "remoteip=any",
+            "enable=yes",
+            "profile=any",
+        ])?;
+
+        if !block_output.status.success() {
+            let stderr = String::from_utf8_lossy(&block_output.stderr);
+            return Err(format!("Failed to create block rule: {}", stderr));
+        }
+        info!("Created firewall block rule: {}", FIREWALL_RULE_BLOCK);
+
+        // Allow WireGuard interface traffic if found
+        if let Some(ref iface) = wg_interface {
+            self.wireguard_interface = Some(iface.clone());
+            
+            // Use PowerShell for interface-specific rule (netsh doesn't support interface filtering)
+            let allow_script = format!(
+                r#"New-NetFirewallRule -DisplayName '{}' -Direction Outbound -Action Allow -InterfaceAlias '{}' -Enabled True -Profile Any"#,
+                FIREWALL_RULE_ALLOW_WG, iface
+            );
+            
+            let allow_output = run_powershell(&allow_script)?;
+            if allow_output.status.success() {
+                info!("Created firewall allow rule for interface: {}", iface);
+            } else {
+                warn!("Could not create WireGuard allow rule, block rule still active");
+            }
+        }
+
+        // Also allow DHCP and DNS for initial connection
+        self.allow_essential_traffic()?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn teardown_wfp(&mut self) -> Result<(), String> {
+        info!("Tearing down Windows Firewall Kill Switch");
+        self.remove_firewall_rules()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn remove_firewall_rules(&self) -> Result<(), String> {
+        // Remove block rule
+        let _ = run_command("netsh", &[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={}", FIREWALL_RULE_BLOCK),
+        ]);
+        info!("Removed firewall block rule");
+
+        // Remove WireGuard allow rule (via PowerShell)
+        let remove_script = format!(
+            r#"Remove-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue"#,
+            FIREWALL_RULE_ALLOW_WG
+        );
+        let _ = run_powershell(&remove_script);
+        info!("Removed WireGuard allow rule");
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn find_wireguard_interface(&self) -> Result<Option<String>, String> {
+        // Find WireGuard interface using PowerShell
+        // Common WireGuard interface names: "wg0", "WireGuard", or any with "wg" prefix
+        let script = r#"
+            $adapters = Get-NetAdapter | Where-Object { 
+                $_.InterfaceDescription -like "*WireGuard*" -or 
+                $_.Name -like "wg*" -or 
+                $_.Name -like "*WireGuard*"
+            }
+            if ($adapters) {
+                $adapters[0].Name
+            }
+        "#;
+        
+        let output = run_powershell(script)?;
+        let iface_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        
+        if iface_name.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(iface_name))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn allow_essential_traffic(&self) -> Result<(), String> {
+        // Allow DHCP (UDP 67, 68) for network connectivity
+        let dhcp_out = run_command("netsh", &[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name=VPNht Kill Switch DHCP Out",
+            "dir=out",
+            "action=allow",
+            "protocol=udp",
+            "localport=68",
+            "remoteport=67",
+            "enable=yes",
+        ])?;
+
+        // Allow DNS (UDP/TCP 53) for name resolution
+        let dns_out = run_command("netsh", &[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name=VPNht Kill Switch DNS Out",
+            "dir=out",
+            "action=allow",
+            "protocol=any",
+            "remoteport=53",
+            "enable=yes",
+        ])?;
+
+        info!("Allowed essential traffic (DHCP, DNS)");
+        Ok(())
+    }
+}
+
+impl Drop for KillSwitch {
+    fn drop(&mut self) {
+        // Ensure firewall rules are cleaned up when KillSwitch is dropped
+        if self.enabled {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = self.teardown_wfp();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_interface_name_valid() {
+        assert_eq!(sanitize_interface_name("wg0"), Ok("wg0".to_string()));
+        assert_eq!(sanitize_interface_name("WireGuard-1"), Ok("WireGuard-1".to_string()));
+        assert_eq!(sanitize_interface_name("vpn_test"), Ok("vpn_test".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_interface_name_too_long() {
+        let long_name = "this_interface_name_is_way_too_long";
+        assert!(sanitize_interface_name(long_name).is_err());
+    }
+
+    #[test]
+    fn test_sanitize_interface_name_invalid_chars() {
+        assert!(sanitize_interface_name("wg 0").is_err()); // space
+        assert!(sanitize_interface_name("wg@0").is_err()); // @
+        assert!(sanitize_interface_name("wg.0").is_err()); // .
+    }
+
+    #[test]
+    fn test_killswitch_new() {
+        let ks = KillSwitch::new();
+        assert!(!ks.enabled);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_firewall_rule_names() {
+        assert_eq!(FIREWALL_RULE_BLOCK, "VPNht Kill Switch Block");
+        assert_eq!(FIREWALL_RULE_ALLOW_WG, "VPNht Kill Switch Allow WireGuard");
     }
 }
