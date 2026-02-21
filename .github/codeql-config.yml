@@ -1,0 +1,30 @@
+# CodeQL Configuration
+# Customizes the CodeQL analysis for the VPN.ht project.
+
+name: "VPN.ht CodeQL Config"
+
+# Define queries to include or exclude
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+# Paths to exclude from analysis
+paths-ignore:
+  - '**/node_modules'
+  - '**/dist'
+  - '**/target'
+  - '**/tests'
+  - '**/*.test.ts'
+  - '**/*.test.tsx'
+  - '**/*.spec.ts'
+  - '**/vitest.config.ts'
+
+# Customize query packs
+query-filters:
+  - exclude:
+      id: js/insecure-randomness
+  - exclude:
+      id: js/missing-rate-limiting
+
+# Disable alerts for specific severities
+disable-default-queries: false
