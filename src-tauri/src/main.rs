@@ -108,8 +108,8 @@ fn main() {
             // Register ConnectionManager as managed state
             app.manage(Arc::new(Mutex::new(ConnectionManager::new())));
             
-            // Register ApiClient as managed state
-            app.manage(Arc::new(ApiClient::new("https://api.vpnht.com")));
+            // Register ApiClient as managed state - using real VPN.ht API
+            app.manage(Arc::new(ApiClient::new()));
             Ok(())
         })
         .run(generate_context!())

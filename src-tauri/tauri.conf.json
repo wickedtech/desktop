@@ -37,6 +37,7 @@
       "http": {
         "all": true,
         "scope": [
+          "https://my.vpn.ht/**",
           "https://api.vpnht.com/graphql",
           "https://api.vpnht.com/v1/**",
           "https://updates.vpnht.com/v1/**",
@@ -111,7 +112,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'nonce-vpnht'; img-src 'self' https: data:; connect-src 'self' https://api.vpnht.com https://ipinfo.io https://*.tile.openstreetmap.org; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'nonce-vpnht'; img-src 'self' https: data:; connect-src 'self' https://my.vpn.ht https://api.vpnht.com https://ipinfo.io https://*.tile.openstreetmap.org; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
       "dangerousDisableAssetCspModification": false,
       "dangerousUseHttpScheme": false,
       "freezePrototype": true

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tauri::{command, State};
 use tokio::sync::Mutex;
 
+use crate::api::ApiClient;
 use crate::config::{Server, WireGuardConfig, generate_wireguard_config};
 use crate::error::{AppError, Result};
 use crate::storage::SecureStorage;
@@ -104,33 +105,29 @@ pub async fn auth_login(
     email: String,
     password: String,
     storage: State<'_, SecureStorage>,
+    api_client: State<'_, Arc<ApiClient>>,
 ) -> Result<AuthResponse> {
     // Validate inputs
     validate_email(&email)?;
     validate_password(&password)?;
     
-    // In a real implementation, this would call the VPNht API
-    // For now, we'll return a mock response
-    
-    // Validate credentials (mock)
-    if email.is_empty() {
-        return Err(AppError::Auth("Invalid credentials".into()));
-    }
+    // Call real VPN.ht API for authentication
+    let (api_user, api_tokens) = api_client.login(&email, &password).await?;
 
     let user = User {
-        id: "user_123".to_string(),
-        email: email.clone(),
+        id: api_user.id,
+        email: api_user.email,
         subscription: Subscription {
-            plan: "premium".to_string(),
-            expires_at: "2025-12-31".to_string(),
-            is_active: true,
+            plan: api_user.subscription.plan,
+            expires_at: api_user.subscription.expires_at,
+            is_active: api_user.subscription.is_active,
         },
     };
 
     let tokens = AuthTokens {
-        access_token: format!("mock_token_{}", uuid::Uuid::new_v4()),
-        refresh_token: format!("mock_refresh_{}", uuid::Uuid::new_v4()),
-        expires_at: chrono::Utc::now().timestamp() + 3600,
+        access_token: api_tokens.access_token,
+        refresh_token: api_tokens.refresh_token,
+        expires_at: api_tokens.expires_at,
     };
 
     // Store tokens securely with validation
@@ -244,33 +241,6 @@ pub async fn fetch_servers(
     Ok(servers)
 }
 
-            supported_protocols: vec!["wireguard".to_string(), "openvpn_udp".to_string(), "openvpn_tcp".to_string()],
-            features: vec!["p2p".to_string(), "streaming".to_string()],
-            latency: Some(85),
-            load: Some(72),
-            is_premium: false,
-        },
-        ServerData {
-            id: "jp-tok".to_string(),
-            name: "Tokyo".to_string(),
-            country: "Japan".to_string(),
-            country_code: "JP".to_string(),
-            city: "Tokyo".to_string(),
-            lat: 35.6762,
-            lng: 139.6503,
-            hostname: "jp-tok.vpnht.com".to_string(),
-            ip: "192.168.3.1".to_string(),
-            port: 443,
-            public_key: "mno345PLACEHOLDER".to_string(),
-            supported_protocols: vec!["wireguard".to_string(), "openvpn_udp".to_string()],
-            features: vec!["p2p".to_string(), "streaming".to_string()],
-            latency: Some(92),
-            load: Some(68),
-            is_premium: false,
-        },
-    ]
-}
-
 // Latency Commands
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LatencyResult {
@@ -289,6 +259,7 @@ pub async fn measure_latency(server_id: String) -> Result<LatencyResult> {
     Ok(LatencyResult {
         server_id,
         latency,
+    })
 }
 
 #[command]
